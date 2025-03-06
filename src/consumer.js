@@ -23,7 +23,10 @@ const kafkaConfig = {
 
 const CONSUMER_GROUP = 'brandpulse-consumer-group';
 const TOPIC = 'tweets';
-const INFLUX_BATCH_SIZE = 10000;
+// Reduced batch size for more frequent writes
+const INFLUX_BATCH_SIZE = 5000;
+// More frequent flush interval
+const FLUSH_INTERVAL_MS = 5000;
 
 // Worker Logic
 if (!isMainThread) {
@@ -37,9 +40,21 @@ if (!isMainThread) {
   });
 
   const influxClient = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
-  const writeApi = influxClient.getWriteApi(INFLUX_ORG, INFLUX_BUCKET, 'ns');
+  const writeApi = influxClient.getWriteApi(INFLUX_ORG, INFLUX_BUCKET, 'ns', {
+    // Add write options for better debugging
+    defaultTags: { source: 'kafkaConsumer' },
+    writeOptions: {
+      batchSize: INFLUX_BATCH_SIZE,
+      flushInterval: FLUSH_INTERVAL_MS,
+      maxRetries: 5,
+      maxRetryDelay: 15000,
+      minRetryDelay: 1000,
+      retryJitter: 1000
+    }
+  });
   
   let pointBuffer = [];
+  let totalFlushedPoints = 0;
   
   const flushPointsToInflux = async () => {
     if (pointBuffer.length === 0) {
@@ -48,13 +63,36 @@ if (!isMainThread) {
     }
     
     try {
-      parentPort.postMessage(`Attempting to flush ${pointBuffer.length} points`);
-      await writeApi.writePoints(pointBuffer);
+      parentPort.postMessage(`Attempting to flush ${pointBuffer.length} points to InfluxDB`);
+      const startTime = Date.now();
+      
+      // Write points to InfluxDB
+      writeApi.writePoints(pointBuffer);
       await writeApi.flush();
-      parentPort.postMessage(`Successfully flushed ${pointBuffer.length} points to InfluxDB`);
+      
+      const flushDuration = Date.now() - startTime;
+      totalFlushedPoints += pointBuffer.length;
+      
+      parentPort.postMessage({
+        type: 'influxFlush',
+        message: `Successfully flushed ${pointBuffer.length} points to InfluxDB in ${flushDuration}ms`,
+        totalFlushed: totalFlushedPoints
+      });
+      
       pointBuffer = [];
     } catch (error) {
-      parentPort.postMessage(`InfluxDB write error: ${error.message}`);
+      parentPort.postMessage({
+        type: 'error',
+        message: `InfluxDB write error: ${error.message}`,
+        stack: error.stack
+      });
+      
+      // Don't clear buffer on error - we'll retry next time
+      if (pointBuffer.length > INFLUX_BATCH_SIZE * 3) {
+        parentPort.postMessage('Buffer too large after errors, discarding oldest points');
+        // Discard oldest half of points to prevent memory issues
+        pointBuffer = pointBuffer.slice(Math.floor(pointBuffer.length / 2));
+      }
     }
   };
 
@@ -83,22 +121,33 @@ if (!isMainThread) {
           
           const startTime = Date.now();
           let processedCount = 0;
+          let errorCount = 0;
           
           for (const message of messages) {
             try {
               const decodedValue = tweetSchema.fromBuffer(message.value);
               
+              // Create a proper InfluxDB point - FIXED TIMESTAMP HANDLING
+              // Use nanosecond precision for InfluxDB
+              const timestamp = new Date(decodedValue.timestamp);
+              // Add microsecond variation to prevent overwrites
+              timestamp.setMilliseconds(timestamp.getMilliseconds() + Math.random());
+              
               const point = new Point('tweets')
+                .tag('brand', 'SuperCoffee')
                 .tag('sentiment', decodedValue.sentiment)
-                .intField('count', 1) // Add count field for aggregation
-                .timestamp(decodedValue.timestamp * 1000000);
+                .stringField('text', decodedValue.text.substring(0, 255))
+                .intField('count', 1)
+                .timestamp(timestamp);
               
               pointBuffer.push(point);
               processedCount++;
               
               resolveOffset(message.offset);
             } catch (err) {
-              parentPort.postMessage(`Error decoding message: ${err.message}`);
+              errorCount++;
+              parentPort.postMessage(`Error processing message: ${err.message}`);
+              // Don't fail the entire batch for one bad message
             }
             
             if (processedCount % 500 === 0) {
@@ -111,18 +160,38 @@ if (!isMainThread) {
           }
           
           const duration = Date.now() - startTime;
-          parentPort.postMessage(`Processed ${processedCount} messages in ${duration}ms from partition ${partition}`);
+          parentPort.postMessage({
+            type: 'batchProcessed',
+            message: `Processed ${processedCount} messages (${errorCount} errors) in ${duration}ms from partition ${partition}`,
+            bufferedPoints: pointBuffer.length
+          });
         }
       });
     } catch (err) {
-      parentPort.postMessage(`Consumer startup error: ${err.message}`);
+      parentPort.postMessage({
+        type: 'error',
+        message: `Consumer startup error: ${err.message}`,
+        stack: err.stack
+      });
     }
   };
 
-  const flushInterval = setInterval(flushPointsToInflux, 10000);
+  // More frequent flush interval
+  const flushInterval = setInterval(flushPointsToInflux, FLUSH_INTERVAL_MS);
+
+  // Add health check interval
+  const healthCheckInterval = setInterval(() => {
+    parentPort.postMessage({
+      type: 'healthCheck',
+      bufferedPoints: pointBuffer.length,
+      totalFlushedPoints: totalFlushedPoints
+    });
+  }, 30000);
 
   process.on('SIGTERM', async () => {
     clearInterval(flushInterval);
+    clearInterval(healthCheckInterval);
+    parentPort.postMessage('Received SIGTERM, flushing remaining points...');
     await flushPointsToInflux();
     await writeApi.close();
     await consumer.disconnect();
@@ -131,7 +200,11 @@ if (!isMainThread) {
   });
 
   runConsumer().catch(err => {
-    parentPort.postMessage(`Fatal consumer error: ${err.message}`);
+    parentPort.postMessage({
+      type: 'fatal',
+      message: `Fatal consumer error: ${err.message}`,
+      stack: err.stack
+    });
     process.exit(1);
   });
 }
@@ -146,7 +219,19 @@ if (isMainThread) {
   const spawnWorker = (id) => {
     const worker = new Worker(__filename);
     worker
-      .on('message', (msg) => console.log(`[Consumer-W${id}] ${typeof msg === 'object' ? JSON.stringify(msg) : msg}`))
+      .on('message', (msg) => {
+        // Better message handling
+        if (typeof msg === 'object' && msg.type) {
+          if (msg.type === 'error' || msg.type === 'fatal') {
+            console.error(`[Consumer-W${id}] ${msg.message}`);
+            if (msg.stack) console.error(`[Consumer-W${id}] Stack: ${msg.stack}`);
+          } else {
+            console.log(`[Consumer-W${id}] ${msg.type}: ${msg.message || JSON.stringify(msg)}`);
+          }
+        } else {
+          console.log(`[Consumer-W${id}] ${typeof msg === 'object' ? JSON.stringify(msg) : msg}`);
+        }
+      })
       .on('error', (err) => console.error(`[Consumer-W${id}] Error: ${err.message}`))
       .on('exit', (code) => {
         console.log(`[Consumer-W${id}] Exited with code ${code}`);
@@ -163,8 +248,9 @@ if (isMainThread) {
   process.on('SIGINT', async () => {
     console.log('\nGracefully shutting down consumer...');
     for (const worker of workers) {
-      await worker.terminate();
+      worker.postMessage({ type: 'shutdown' });
+      setTimeout(() => worker.terminate(), 15000); // Force terminate after 15s if needed
     }
-    process.exit(0);
+    setTimeout(() => process.exit(0), 20000); // Ensure we exit eventually
   });
 }
