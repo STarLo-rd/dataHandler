@@ -20,3 +20,19 @@ from(bucket: "datastorm")
   User Interface Considerations
 The pie chart is good for snapshot views, but adding a line chart for trends and a bar chart for comparisons will create a standard dashboard layout, similar to tools like Google Analytics.
 For fun elements, consider popups with animations (e.g., using libraries like Anime.js) for alerts, making the MVP more engaging.
+
+
+The BrandPulse dashboard, currently focused on real-time sentiment analysis via a pie chart, can be significantly enhanced to meet the needs of a robust social media monitoring system for "SuperCoffee." Given the MVP nature of the project and the user's intent to integrate more functionalities, this note explores additional features, user interface improvements, and considerations for future scalability, especially with plans for Dockerization and Kubernetes deployment.
+
+
+Expected Throughput
+Processing: Each worker can process ~700k msg/s with larger batches (e.g., 50k messages in ~70ms).
+Writing: 4 InfluxDB writers, each handling 200k points in ~200ms, could achieve ~4M points/s total, but realistically, expect ~1-2M points/s with a single InfluxDB node.
+Overall: With 16 workers and optimized writes, you should exceed 500k msg/s easily, potentially reaching 1M+ msg/s if InfluxDB keeps up.
+
+To hit 500k msg/s (and potentially scale higher), we need to:
+Decouple processing and writing: Offload InfluxDB writes to dedicated threads or a queue.
+Increase batch sizes: Larger Kafka batches reduce fetch overhead.
+Optimize InfluxDB writes: Use parallel writers and tune InfluxDB settings.
+Maximize worker parallelism: Ensure all workers are fully utilized.
+
