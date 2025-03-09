@@ -3,12 +3,13 @@ const http = require('http');
 const socketIo = require('socket.io');
 const { InfluxDB } = require('@influxdata/influxdb-client');
 const path = require('path');
+require('dotenv').config(); // Load .env file for configuration
 
-// InfluxDB configuration
-const token = 'OS0t8w6jBnwwL-HIWgU1lWniUARhRc85gLtFqTbhZiEqVNPvludyzs1vswBDAsegbfWk1pJGpk3dY1LKK_2zDQ==';
-const org = '6914ea40681fbe1d';
-const bucket = 'brandpulse';
-const url = 'http://localhost:8086';
+// InfluxDB configuration (from .env or defaults)
+const token = process.env.INFLUXDB_TOKEN || 'OS0t8w6jBnwwL-HIWgU1lWniUARhRc85gLtFqTbhZiEqVNPvludyzs1vswBDAsegbfWk1pJGpk3dY1LKK_2zDQ==';
+const org = process.env.INFLUXDB_ORG || '6914ea40681fbe1d';
+const bucket = process.env.INFLUXDB_BUCKET || 'brandpulse';
+const url = process.env.INFLUXDB_URL || 'http://localhost:8086';
 const client = new InfluxDB({ url, token });
 const queryApi = client.getQueryApi(org);
 
@@ -17,7 +18,7 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
-// Serve static files (index.html, Chart.js)
+// Serve static files (index.html, Chart.js, sounds)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve the dashboard
@@ -25,28 +26,37 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Corrected Flux query
+// Flux queries
 const sentimentQuery = `
   from(bucket: "${bucket}")
-    |> range(start: -10m)
+    |> range(start: -5m)
     |> filter(fn: (r) => r._measurement == "tweets")
     |> filter(fn: (r) => r._field == "count")
     |> group(columns: ["sentiment"])
     |> sum()
 `;
 
-// Real-time data update
+const historicalQuery = `
+  from(bucket: "${bucket}")
+    |> range(start: -1h)
+    |> filter(fn: (r) => r._measurement == "tweets")
+    |> filter(fn: (r) => r._field == "count")
+    |> aggregateWindow(every: 1m, fn: sum)
+    |> group(columns: ["sentiment"])
+    |> pivot(rowKey: ["_time"], columnKey: ["sentiment"], valueColumn: "_value")
+`;
+
+// Real-time and historical data update
 const updateDashboard = async () => {
   try {
-    const rows = await queryApi.collectRows(sentimentQuery);
-    console.log('Query result:', JSON.stringify(rows, null, 2)); // Detailed logging
-
+    // Real-time sentiment data
+    const sentimentRows = await queryApi.collectRows(sentimentQuery);
     const sentimentCounts = { positive: 0, negative: 0, neutral: 0 };
     
-    rows.forEach(row => {
-      if (row.sentiment === 'positive') sentimentCounts.positive = row._value;
-      if (row.sentiment === 'negative') sentimentCounts.negative = row._value;
-      if (row.sentiment === 'neutral') sentimentCounts.neutral = row._value;
+    sentimentRows.forEach(row => {
+      if (row.sentiment === 'positive') sentimentCounts.positive = row._value || 0;
+      if (row.sentiment === 'negative') sentimentCounts.negative = row._value || 0;
+      if (row.sentiment === 'neutral') sentimentCounts.neutral = row._value || 0;
     });
 
     const total = sentimentCounts.positive + sentimentCounts.negative + sentimentCounts.neutral;
@@ -56,13 +66,38 @@ const updateDashboard = async () => {
       neutral: total ? (sentimentCounts.neutral / total * 100).toFixed(1) : 0,
     };
 
-    // Check for crisis alert (negatives > 50%)
-    const alert = sentimentPercentages.negative > 50 ? 'Crisis Alert: Negative sentiment spike!' : null;
+    // Historical sentiment data
+    const historicalRows = await queryApi.collectRows(historicalQuery);
+    const historicalData = {
+      positive: [],
+      negative: [],
+      neutral: [],
+      labels: []
+    };
+
+    historicalRows.forEach(row => {
+      const time = new Date(row._time).toISOString();
+      historicalData.labels.push(time);
+      historicalData.positive.push(row.positive ? (row.positive / (row.positive + row.negative + row.neutral) * 100).toFixed(1) : 0);
+      historicalData.negative.push(row.negative ? (row.negative / (row.positive + row.negative + row.neutral) * 100).toFixed(1) : 0);
+      historicalData.neutral.push(row.neutral ? (row.neutral / (row.positive + row.negative + row.neutral) * 100).toFixed(1) : 0);
+    });
+
+    // Alerts
+    const alertMessages = [];
+    if (sentimentPercentages.negative > 50) {
+      alertMessages.push('Crisis Alert: Negative sentiment spike!');
+    }
+    if (sentimentPercentages.positive > 70) {
+      alertMessages.push('Opportunity Alert: Positive sentiment surge!');
+    }
+    const alert = alertMessages.join('\n');
 
     // Emit to all connected clients
     io.emit('sentimentUpdate', {
       sentiment: sentimentPercentages,
-      totalTweets: 500000, // Fixed at 500K/sec for demo
+      totalTweets: total, // Use actual total from InfluxDB
+      historical: historicalData,
       alert,
     });
   } catch (err) {
@@ -80,7 +115,7 @@ io.on('connection', (socket) => {
 });
 
 // Start server
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Dashboard running on http://localhost:${PORT}`);
 });

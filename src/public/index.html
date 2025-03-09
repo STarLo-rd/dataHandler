@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -12,34 +13,63 @@
       margin: 0;
       padding: 20px;
     }
-    #chartContainer {
-      width: 50%;
-      margin: 0 auto;
+
+    .chart-container {
+      width: 45%;
+      display: inline-block;
+      vertical-align: top;
+      margin: 10px;
     }
+
     #tweetCounter {
       font-size: 24px;
       margin: 20px 0;
     }
+
     #alertBox {
-      color: red;
       font-weight: bold;
       margin: 20px 0;
       display: none;
+      padding: 10px;
+      border-radius: 5px;
     }
+
+    #alertBox.crisis {
+      background-color: #ffcccc;
+      color: #d00000;
+    }
+
+    #alertBox.opportunity {
+      background-color: #ccffcc;
+      color: #006400;
+    }
+
     button {
       padding: 10px 20px;
       margin: 5px;
       font-size: 16px;
       cursor: pointer;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 5px;
+    }
+
+    button:hover {
+      background-color: #0056b3;
     }
   </style>
 </head>
+
 <body>
   <h1>BrandPulse: SuperCoffee Sentiment Dashboard</h1>
-  <div id="chartContainer">
+  <div class="chart-container">
     <canvas id="sentimentChart"></canvas>
   </div>
-  <div id="tweetCounter">Tweets per second: 0</div>
+  <div class="chart-container">
+    <canvas id="sentimentTrendChart"></canvas>
+  </div>
+  <div id="tweetCounter">Tweets processed: 0</div>
   <div id="alertBox"></div>
   <div>
     <button onclick="startDemo()">Start Tweet Storm</button>
@@ -48,12 +78,19 @@
     <button onclick="triggerOpportunity()">Trigger Opportunity</button>
   </div>
 
+  <!-- Audio for alerts -->
+  <audio id="crisisSound" src="/crisis.mp3"></audio>
+  <audio id="opportunitySound" src="/opportunity.mp3"></audio>
+
   <!-- Dependencies -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
 
   <script>
-    // Chart.js setup
+    // Pie Chart for real-time sentiment
     const ctx = document.getElementById('sentimentChart').getContext('2d');
     const sentimentChart = new Chart(ctx, {
       type: 'pie',
@@ -68,10 +105,10 @@
         responsive: true,
         plugins: {
           legend: { position: 'top' },
-          title: { display: true, text: 'Live Sentiment Analysis' },
+          title: { display: true, text: 'Current Sentiment Distribution' },
           tooltip: {
             callbacks: {
-              label: function(context) {
+              label: function (context) {
                 return `${context.label}: ${context.raw}%`;
               }
             }
@@ -80,11 +117,39 @@
       }
     });
 
+    // Line Chart for historical trends
+    const trendCtx = document.getElementById('sentimentTrendChart').getContext('2d');
+    const sentimentTrendChart = new Chart(trendCtx, {
+      type: 'line',
+      data: {
+        datasets: [
+          { label: 'Positive', data: [], borderColor: '#36A2EB', fill: false },
+          { label: 'Negative', data: [], borderColor: '#FF6384', fill: false },
+          { label: 'Neutral', data: [], borderColor: '#FFCE56', fill: false },
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { position: 'top' },
+          title: { display: true, text: 'Sentiment Trends (Last Hour)' },
+        },
+        scales: {
+          x: { type: 'time', time: { unit: 'minute' } },
+          y: { beginAtZero: true, max: 100, title: { display: true, text: 'Percentage (%)' } }
+        }
+      }
+    });
+
+    // Store the last triggered alert timestamp
+    let lastAlertTimestamp = 0;
+    const ALERT_COOLDOWN = 120000; // 2 minutes in milliseconds
+
+
     // Socket.io connection
     const socket = io();
     socket.on('sentimentUpdate', (data) => {
-      console.log('Received sentimentUpdate:', data); // Debug logging
-
+      // Update pie chart
       sentimentChart.data.datasets[0].data = [
         data.sentiment.positive,
         data.sentiment.negative,
@@ -92,22 +157,77 @@
       ];
       sentimentChart.update();
 
-      document.getElementById('tweetCounter').textContent = `Tweets per second: ${data.totalTweets.toLocaleString()}`;
-      
+      // Update line chart
+      sentimentTrendChart.data.labels = data.historical.labels;
+      sentimentTrendChart.data.datasets[0].data = data.historical.positive.map((y, i) => ({ x: data.historical.labels[i], y }));
+      sentimentTrendChart.data.datasets[1].data = data.historical.negative.map((y, i) => ({ x: data.historical.labels[i], y }));
+      sentimentTrendChart.data.datasets[2].data = data.historical.neutral.map((y, i) => ({ x: data.historical.labels[i], y }));
+      sentimentTrendChart.update();
+
+      // Update tweet counter
+      document.getElementById('tweetCounter').textContent = `Tweets processed: ${data.totalTweets.toLocaleString()}`;
+
+      // Handle alerts with cooldown
       const alertBox = document.getElementById('alertBox');
-      if (data.alert) {
+      const now = Date.now();
+
+      if (data.alert && (now - lastAlertTimestamp > ALERT_COOLDOWN)) {
         alertBox.textContent = data.alert;
         alertBox.style.display = 'block';
-      } else {
+
+        // if (data.alert.includes('Crisis')) {
+        //   alertBox.className = 'crisis';
+        //   document.getElementById('crisisSound').play();
+        //   showNotification('Crisis Alert: Negative sentiment spike!');
+        // } else if (data.alert.includes('Opportunity')) {
+        //   alertBox.className = 'opportunity';
+        //   // document.getElementById('opportunitySound').play();
+        //   confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
+        //   // showNotification('Opportunity Alert: Positive sentiment surge!');
+        // }
+
+        lastAlertTimestamp = now; // Update last triggered time
+      } else if (!data.alert) {
         alertBox.style.display = 'none';
+        alertBox.className = '';
       }
     });
 
-    // Placeholder functions for buttons (requires producer integration)
-    function startDemo() { alert('Start tweet storm (integrate with producer)'); }
-    function stopDemo() { alert('Stop tweet storm (integrate with producer)'); }
-    function triggerCrisis() { alert('Trigger crisis scenario (adjust producer sentiment)'); }
-    function triggerOpportunity() { alert('Trigger opportunity scenario (adjust producer sentiment)'); }
+    // Function to handle browser notifications
+    function showNotification(message) {
+      // if (Notification.permission === 'granted') {
+      //   new Notification(message);
+      // } else {
+      //   Notification.requestPermission();
+      // }
+    }
+
+
+    // Interactive controls (API calls to producer)
+    function startDemo() {
+      fetch('http://localhost:3001/start', { method: 'POST' })
+        .then(response => console.log('Started tweet storm'))
+        .catch(err => console.error('Error starting tweet storm:', err));
+    }
+
+    function stopDemo() {
+      fetch('http://localhost:3001/stop', { method: 'POST' })
+        .then(response => console.log('Stopped tweet storm'))
+        .catch(err => console.error('Error stopping tweet storm:', err));
+    }
+
+    function triggerCrisis() {
+      fetch('http://localhost:3001/trigger/crisis', { method: 'POST' })
+        .then(response => console.log('Triggered crisis'))
+        .catch(err => console.error('Error triggering crisis:', err));
+    }
+
+    function triggerOpportunity() {
+      fetch('http://localhost:3001/trigger/opportunity', { method: 'POST' })
+        .then(response => console.log('Triggered opportunity'))
+        .catch(err => console.error('Error triggering opportunity:', err));
+    }
   </script>
 </body>
+
 </html>
