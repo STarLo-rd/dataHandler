@@ -1,6 +1,6 @@
 const { Kafka } = require('kafkajs');
 const { Worker, isMainThread, parentPort, threadId } = require('worker_threads');
-const tweetSchema = require('../schema/tweetSchema');
+const tweetSchema = require('../../schema/tweetSchema');
 const os = require('os');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 const { Queue, Worker: BullWorker } = require('bullmq');

@@ -36,3 +36,6 @@ Increase batch sizes: Larger Kafka batches reduce fetch overhead.
 Optimize InfluxDB writes: Use parallel writers and tune InfluxDB settings.
 Maximize worker parallelism: Ensure all workers are fully utilized.
 
+Decoupled InfluxDB Writes:
+Added BullMQ (requires Redis) to queue points for writing asynchronously.
+A dedicated BullWorker with 4 concurrent writers handles InfluxDB writes, freeing consumer workers to focus on processing.

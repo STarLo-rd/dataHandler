@@ -18,7 +18,7 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
-// Serve static files (index.html, Chart.js, sounds)
+// Serve static files (index.html, sounds)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve the dashboard
@@ -36,9 +36,10 @@ const sentimentQuery = `
     |> sum()
 `;
 
-const historicalQuery = `
+let timeRange = '-1h'; // Default time range
+const getHistoricalQuery = () => `
   from(bucket: "${bucket}")
-    |> range(start: -1h)
+    |> range(start: ${timeRange})
     |> filter(fn: (r) => r._measurement == "tweets")
     |> filter(fn: (r) => r._field == "count")
     |> aggregateWindow(every: 1m, fn: sum)
@@ -67,7 +68,7 @@ const updateDashboard = async () => {
     };
 
     // Historical sentiment data
-    const historicalRows = await queryApi.collectRows(historicalQuery);
+    const historicalRows = await queryApi.collectRows(getHistoricalQuery());
     const historicalData = {
       positive: [],
       negative: [],
@@ -96,7 +97,7 @@ const updateDashboard = async () => {
     // Emit to all connected clients
     io.emit('sentimentUpdate', {
       sentiment: sentimentPercentages,
-      totalTweets: total, // Use actual total from InfluxDB
+      totalTweets: total,
       historical: historicalData,
       alert,
     });
@@ -111,6 +112,10 @@ setInterval(updateDashboard, 1000);
 // Socket.io connection
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
+  socket.on('setTimeRange', (newTimeRange) => {
+    timeRange = newTimeRange; // Update time range based on client selection
+    console.log(`Time range updated to: ${timeRange}`);
+  });
   socket.on('disconnect', () => console.log('Client disconnected:', socket.id));
 });
 

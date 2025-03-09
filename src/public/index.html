@@ -26,6 +26,12 @@
       margin: 20px 0;
     }
 
+    #sentimentScore {
+      font-size: 28px;
+      font-weight: bold;
+      margin: 20px 0;
+    }
+
     #alertBox {
       font-weight: bold;
       margin: 20px 0;
@@ -44,7 +50,7 @@
       color: #006400;
     }
 
-    button {
+    button, select {
       padding: 10px 20px;
       margin: 5px;
       font-size: 16px;
@@ -55,27 +61,48 @@
       border-radius: 5px;
     }
 
-    button:hover {
+    button:hover, select:hover {
       background-color: #0056b3;
+    }
+
+    #loading {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 20px;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 20px;
+      border-radius: 5px;
     }
   </style>
 </head>
 
 <body>
   <h1>BrandPulse: SuperCoffee Sentiment Dashboard</h1>
+  <div id="loading">Loading...</div>
   <div class="chart-container">
     <canvas id="sentimentChart"></canvas>
   </div>
   <div class="chart-container">
     <canvas id="sentimentTrendChart"></canvas>
   </div>
-  <div id="tweetCounter">Tweets processed: 0</div>
+  <div id="tweetCounter">Tweets processed: 0 (0 tweets/min)</div>
+  <div id="sentimentScore">Sentiment Score: 0%</div>
   <div id="alertBox"></div>
   <div>
     <button onclick="startDemo()">Start Tweet Storm</button>
     <button onclick="stopDemo()">Stop Tweet Storm</button>
     <button onclick="triggerCrisis()">Trigger Crisis</button>
     <button onclick="triggerOpportunity()">Trigger Opportunity</button>
+    <select id="timeRange" onchange="updateTimeRange()">
+      <option value="-5m">Last 5 Minutes</option>
+      <option value="-30m">Last 30 Minutes</option>
+      <option value="-1h" selected>Last 1 Hour</option>
+      <option value="-6h">Last 6 Hours</option>
+      <option value="-24h">Last 24 Hours</option>
+    </select>
   </div>
 
   <!-- Audio for alerts -->
@@ -85,13 +112,12 @@
   <!-- Dependencies -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
-  <script
-    src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 
   <script>
     // Pie Chart for real-time sentiment
     const ctx = document.getElementById('sentimentChart').getContext('2d');
+    let currentTotalTweets = 0; // Store total tweets for tooltip calculation
     const sentimentChart = new Chart(ctx, {
       type: 'pie',
       data: {
@@ -105,12 +131,14 @@
         responsive: true,
         plugins: {
           legend: { position: 'top' },
-          title: { display: true, text: 'Current Sentiment Distribution' },
-          tooltip: {
-            callbacks: {
-              label: function (context) {
-                return `${context.label}: ${context.raw}%`;
-              }
+          title: { display: true, text: 'Current Sentiment Distribution' }
+        },
+        tooltips: {  // Corrected to 'tooltips' for Chart.js 3.x
+          callbacks: {
+            label: function (context) {
+              const percentage = context.parsed;
+              const count = Math.round((percentage / 100) * currentTotalTweets);
+              return `${context.label}: ${percentage}% (${count} tweets)`;
             }
           }
         }
@@ -132,7 +160,7 @@
         responsive: true,
         plugins: {
           legend: { position: 'top' },
-          title: { display: true, text: 'Sentiment Trends (Last Hour)' },
+          title: { display: true, text: 'Sentiment Trends' }
         },
         scales: {
           x: { type: 'time', time: { unit: 'minute' } },
@@ -141,15 +169,19 @@
       }
     });
 
-    // Store the last triggered alert timestamp
+    // Store the last triggered alert timestamp and tweet rate data
     let lastAlertTimestamp = 0;
     const ALERT_COOLDOWN = 120000; // 2 minutes in milliseconds
-
+    let previousTotalTweets = 0;
 
     // Socket.io connection
     const socket = io();
     socket.on('sentimentUpdate', (data) => {
+      // Hide loading indicator on first update
+      document.getElementById('loading').style.display = 'none';
+
       // Update pie chart
+      currentTotalTweets = data.totalTweets; // Store total tweets for tooltips
       sentimentChart.data.datasets[0].data = [
         data.sentiment.positive,
         data.sentiment.negative,
@@ -158,50 +190,41 @@
       sentimentChart.update();
 
       // Update line chart
-      sentimentTrendChart.data.labels = data.historical.labels;
       sentimentTrendChart.data.datasets[0].data = data.historical.positive.map((y, i) => ({ x: data.historical.labels[i], y }));
       sentimentTrendChart.data.datasets[1].data = data.historical.negative.map((y, i) => ({ x: data.historical.labels[i], y }));
       sentimentTrendChart.data.datasets[2].data = data.historical.neutral.map((y, i) => ({ x: data.historical.labels[i], y }));
       sentimentTrendChart.update();
 
-      // Update tweet counter
-      document.getElementById('tweetCounter').textContent = `Tweets processed: ${data.totalTweets.toLocaleString()}`;
+      // Update tweet counter with rate
+      const tweetRate = Math.round((data.totalTweets - previousTotalTweets) * 60); // Tweets per minute
+      document.getElementById('tweetCounter').textContent = `Tweets processed: ${data.totalTweets.toLocaleString()} (${tweetRate} tweets/min)`;
+      previousTotalTweets = data.totalTweets;
+
+      // Update sentiment score
+      const score = (data.sentiment.positive - data.sentiment.negative).toFixed(1);
+      const scoreElement = document.getElementById('sentimentScore');
+      scoreElement.textContent = `Sentiment Score: ${score > 0 ? '+' : ''}${score}%`;
+      scoreElement.style.color = score >= 0 ? '#36A2EB' : '#FF6384';
 
       // Handle alerts with cooldown
       const alertBox = document.getElementById('alertBox');
       const now = Date.now();
-
       if (data.alert && (now - lastAlertTimestamp > ALERT_COOLDOWN)) {
         alertBox.textContent = data.alert;
         alertBox.style.display = 'block';
-
-        // if (data.alert.includes('Crisis')) {
-        //   alertBox.className = 'crisis';
-        //   document.getElementById('crisisSound').play();
-        //   showNotification('Crisis Alert: Negative sentiment spike!');
-        // } else if (data.alert.includes('Opportunity')) {
-        //   alertBox.className = 'opportunity';
-        //   // document.getElementById('opportunitySound').play();
-        //   confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
-        //   // showNotification('Opportunity Alert: Positive sentiment surge!');
-        // }
-
-        lastAlertTimestamp = now; // Update last triggered time
+        lastAlertTimestamp = now;
+        if (data.alert.includes('Crisis')) {
+          alertBox.className = 'crisis';
+          document.getElementById('crisisSound').play();
+        } else if (data.alert.includes('Opportunity')) {
+          alertBox.className = 'opportunity';
+          document.getElementById('opportunitySound').play();
+        }
       } else if (!data.alert) {
         alertBox.style.display = 'none';
         alertBox.className = '';
       }
     });
-
-    // Function to handle browser notifications
-    function showNotification(message) {
-      // if (Notification.permission === 'granted') {
-      //   new Notification(message);
-      // } else {
-      //   Notification.requestPermission();
-      // }
-    }
-
 
     // Interactive controls (API calls to producer)
     function startDemo() {
@@ -226,6 +249,11 @@
       fetch('http://localhost:3001/trigger/opportunity', { method: 'POST' })
         .then(response => console.log('Triggered opportunity'))
         .catch(err => console.error('Error triggering opportunity:', err));
+    }
+
+    function updateTimeRange() {
+      const timeRange = document.getElementById('timeRange').value;
+      socket.emit('setTimeRange', timeRange); // Send time range to server
     }
   </script>
 </body>

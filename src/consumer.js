@@ -25,7 +25,7 @@ const CONSUMER_GROUP = 'brandpulse-consumer-group';
 const TOPIC = 'tweets';
 const INFLUX_BATCH_SIZE = 5000; // Larger batch size for high throughput
 const FLUSH_INTERVAL_MS = 100; // Flush every 100ms for responsiveness
-const WORKER_COUNT = Math.max(os.cpus().length, 8); // Scale workers beyond 4, adjust based on partitions
+const WORKER_COUNT = Math.min(os.cpus().length, 4); // Scale workers beyond 4, adjust based on partitions
 
 // Worker Logic
 if (!isMainThread) {
