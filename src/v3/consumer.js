@@ -7,7 +7,8 @@ const { Queue, Worker: BullWorker } = require('bullmq');
 
 // System configuration
 const totalMemory = os.totalmem();
-const MAX_MEMORY_USAGE = totalMemory * 0.85; // Max 90% of system memory
+const MAX_MEMORY_USAGE = totalMemory * 0.9; // Max 90% of system memory
+const BUFFER_CAP = 5000; // Hard cap on dataBuffer size (items)
 
 // InfluxDB configuration
 const INFLUX_URL = 'http://localhost:8086';
@@ -24,10 +25,10 @@ const kafkaConfig = {
 
 const CONSUMER_GROUP = 'brandpulse-consumer-group';
 const TOPIC = 'tweets';
-const INFLUX_BATCH_SIZE = 10000; // Larger batch size for throughput
-const WORKER_COUNT = Math.min(os.cpus().length, 6); // More consumer workers
-const WRITER_COUNT = 4; // More writer workers
-const FLUSH_INTERVAL_MS = 500; // Faster flush interval
+const INFLUX_BATCH_SIZE = 5000; // Reduced batch size to control memory
+const WORKER_COUNT = Math.min(os.cpus().length - 1, 4); // Fewer consumer workers
+const WRITER_COUNT = 2; // Fewer writer workers
+const FLUSH_INTERVAL_MS = 250; // Tighter flush interval
 const REDIS_CONFIG = { host: 'localhost', port: 6379 };
 
 // Memory monitoring function
@@ -40,13 +41,13 @@ function checkMemoryUsage() {
     processMemory: used,
     systemMemory: systemUsedMemory,
     percentUsed: (systemUsedMemory / totalMemory) * 100,
-    overThreshold: systemUsedMemory > MAX_MEMORY_USAGE,
+    overThreshold: systemUsedMemory > MAX_MEMORY_USAGE * 0.9, // Trigger at 81% (90% of 90%)
   };
 }
 
 // Main Thread
 if (isMainThread) {
-  console.log(`Starting BrandPulse pipeline with ${WORKER_COUNT} consumer workers and ${WRITER_COUNT} writer workers (High-Throughput with BullMQ)`);
+  console.log(`Starting BrandPulse pipeline with ${WORKER_COUNT} consumer workers and ${WRITER_COUNT} writer workers (Memory-Stable with BullMQ)`);
   console.log(`System memory: ${(totalMemory / (1024 * 1024 * 1024)).toFixed(2)} GB`);
   console.log(`Max memory usage: ${(MAX_MEMORY_USAGE / (1024 * 1024 * 1024)).toFixed(2)} GB (90%)`);
   
@@ -83,6 +84,15 @@ if (isMainThread) {
   
   // Spawn writer workers (BullMQ)
   const writerWorkers = [];
+  const influxClient = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
+  const writeApi = influxClient.getWriteApi(INFLUX_ORG, INFLUX_BUCKET, 'ns', {
+    writeOptions: {
+      batchSize: INFLUX_BATCH_SIZE,
+      flushInterval: FLUSH_INTERVAL_MS,
+      maxRetries: 3,
+    },
+  });
+  
   for (let i = 0; i < WRITER_COUNT; i++) {
     const writer = new BullWorker(
       'influx-writes',
@@ -90,15 +100,6 @@ if (isMainThread) {
         const { data } = job.data;
         const startTime = Date.now();
         try {
-          const influxClient = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
-          const writeApi = influxClient.getWriteApi(INFLUX_ORG, INFLUX_BUCKET, 'ns', {
-            writeOptions: {
-              batchSize: INFLUX_BATCH_SIZE,
-              flushInterval: FLUSH_INTERVAL_MS,
-              maxRetries: 3,
-            },
-          });
-          
           const points = data.map((item) =>
             new Point('tweets')
               .tag('brand', 'SuperCoffee')
@@ -108,23 +109,26 @@ if (isMainThread) {
               .timestamp(new Date(item.timestamp))
           );
           
-          writeApi.writePoints(points);
-          await writeApi.flush();
+          // Write in smaller chunks to avoid memory spikes
+          for (let j = 0; j < points.length; j += 1000) {
+            const chunk = points.slice(j, j + 1000);
+            writeApi.writePoints(chunk);
+            await writeApi.flush();
+          }
           console.log(`[WriterWorker ${i + 1}] Flushed ${points.length} points in ${Date.now() - startTime}ms`);
-          await writeApi.close();
         } catch (err) {
           console.error(`[WriterWorker ${i + 1}] Write error: ${err.message}`);
           throw err; // Retry job
         }
       },
-      { connection: REDIS_CONFIG, concurrency: 2 } // Higher concurrency for throughput
+      { connection: REDIS_CONFIG, concurrency: 1 } // Single concurrency to minimize memory
     );
     writerWorkers.push(writer);
   }
   
   // Start consumer workers gradually
   for (let i = 1; i <= WORKER_COUNT; i++) {
-    setTimeout(() => spawnConsumerWorker(i), i * 1000); // Reduced delay for faster startup
+    setTimeout(() => spawnConsumerWorker(i), i * 1000);
   }
   
   // System-wide memory monitoring
@@ -143,7 +147,7 @@ if (isMainThread) {
       }
       systemPaused = false;
     }
-    if (Date.now() % 5000 < 500) { // Every 5s for tighter monitoring
+    if (Date.now() % 5000 < 500) {
       console.log(`Memory usage: ${memUsage.percentUsed.toFixed(1)}% | Free: ${(os.freemem() / (1024 * 1024 * 1024)).toFixed(2)} GB`);
     }
   };
@@ -171,6 +175,7 @@ if (isMainThread) {
     for (const writer of writerWorkers) {
       await writer.close();
     }
+    await writeApi.close();
     await influxQueue.close();
     setTimeout(() => process.exit(0), 15000);
   });
@@ -182,9 +187,9 @@ if (!isMainThread && process.env.IS_CONSUMER) {
     groupId: `${CONSUMER_GROUP}-${threadId}`,
     sessionTimeout: 30000,
     heartbeatInterval: 5000,
-    maxBytesPerPartition: 5 * 1024 * 1024, // Increased to 5MB for more messages
-    maxBytes: 20 * 1024 * 1024, // Increased to 20MB
-    maxWaitTimeInMs: 50, // Reduced wait time for faster polling
+    maxBytesPerPartition: 2 * 1024 * 1024, // Reduced to 2MB to control memory
+    maxBytes: 8 * 1024 * 1024, // Reduced to 8MB
+    maxWaitTimeInMs: 50,
   });
   
   const influxQueue = new Queue('influx-writes', { connection: REDIS_CONFIG });
@@ -193,7 +198,7 @@ if (!isMainThread && process.env.IS_CONSUMER) {
   let totalProcessed = 0;
   let paused = false;
   
-  const memoryCheckInterval = setInterval(() => {
+  const memoryCheck = () => {
     const memUsage = checkMemoryUsage();
     if (memUsage.overThreshold && !paused) {
       paused = true;
@@ -205,7 +210,8 @@ if (!isMainThread && process.env.IS_CONSUMER) {
       consumer.resume([{ topic: TOPIC }]);
       parentPort.postMessage({ type: 'info', message: `Memory usage normal (${memUsage.percentUsed.toFixed(1)}%). Resuming consumer.` });
     }
-  }, 500);
+    return memUsage.overThreshold;
+  };
   
   const processMessages = async (messages) => {
     const rawData = [];
@@ -220,6 +226,8 @@ if (!isMainThread && process.env.IS_CONSUMER) {
       } catch (err) {
         parentPort.postMessage({ type: 'error', message: `Parse error: ${err.message}` });
       }
+      // Early exit if buffer nears cap
+      if (dataBuffer.length + rawData.length >= BUFFER_CAP) break;
     }
     return rawData;
   };
@@ -250,11 +258,17 @@ if (!isMainThread && process.env.IS_CONSUMER) {
         if (paused) return;
         const startTime = Date.now();
         const messages = batch.messages;
+        
+        if (memoryCheck()) return; // Check memory before processing
+        
         const rawData = await processMessages(messages);
         dataBuffer.push(...rawData);
-        totalProcessed += messages.length;
+        totalProcessed += rawData.length; // Count only processed items
         
-        if (dataBuffer.length >= INFLUX_BATCH_SIZE) {
+        // Immediate flush if buffer exceeds cap or batch size
+        if (dataBuffer.length >= INFLUX_BATCH_SIZE || dataBuffer.length >= BUFFER_CAP) {
+          await flushToQueue();
+        } else if (checkMemoryUsage().percentUsed > 80) { // Flush early if nearing limit
           await flushToQueue();
         }
         
@@ -263,8 +277,8 @@ if (!isMainThread && process.env.IS_CONSUMER) {
         
         parentPort.postMessage({
           type: 'processed',
-          count: messages.length,
-          message: `Processed ${messages.length} messages in ${Date.now() - startTime}ms`,
+          count: rawData.length,
+          message: `Processed ${rawData.length} messages in ${Date.now() - startTime}ms`,
         });
       },
     });
@@ -278,7 +292,6 @@ if (!isMainThread && process.env.IS_CONSUMER) {
   parentPort.on('message', async (msg) => {
     if (msg.type === 'shutdown') {
       clearInterval(flushInterval);
-      clearInterval(memoryCheckInterval);
       await flushToQueue();
       await consumer.disconnect();
       await influxQueue.close();
